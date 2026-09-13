@@ -9,22 +9,23 @@ import cv2
 import numpy as np
 import pytesseract
 
-from sudoku_solver.cells import remove_border
+from sudoku_solver.cells import remove_border, remove_grid_lines
 
 _TESSERACT_CONFIG = "--psm 10 -c tessedit_char_whitelist=123456789"
 
 
 def recognize_digit(cell: np.ndarray) -> int:
     """セル画像から数字を1つ認識する。読み取れない場合は0（空白）を返す。"""
-    inner = remove_border(cell)
+    inner = remove_border(remove_grid_lines(cell))
     if inner.size == 0:
         return 0
 
     resized = cv2.resize(inner, (56, 56), interpolation=cv2.INTER_CUBIC)
     _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    padded = cv2.copyMakeBorder(thresh, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
-    text = pytesseract.image_to_string(thresh, config=_TESSERACT_CONFIG).strip()
-    return int(text) if text.isdigit() and text != "0" else 0
+    text = pytesseract.image_to_string(padded, config=_TESSERACT_CONFIG).strip()
+    return int(text) if len(text) == 1 and text.isdigit() and text != "0" else 0
 
 
 def recognize_grid(cell_rows: list[list[np.ndarray]], is_blank) -> list[list[int]]:

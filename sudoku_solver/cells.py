@@ -20,21 +20,59 @@ def split_into_cells(warped_image: np.ndarray) -> list[list[np.ndarray]]:
 
 
 def remove_border(cell: np.ndarray, border_ratio: float = 0.12) -> np.ndarray:
-    """セルの外周（グリッド線が残りやすい部分）を切り落とす。"""
+    """セルの外周を固定比率で切り落とす（罫線が薄い場合の簡易フォールバック用）。"""
     h, w = cell.shape[:2]
     by, bx = int(h * border_ratio), int(w * border_ratio)
     return cell[by:h - by, bx:w - bx]
 
 
-def is_blank_cell(cell: np.ndarray, black_pixel_ratio_threshold: float = 0.02) -> bool:
-    """セルが空白（数字が書かれていない）かどうかを黒画素の比率で判定する。
+def remove_grid_lines(cell: np.ndarray, brightness_threshold: int = 200) -> np.ndarray:
+    """セル四辺から内側へスキャンし、辺に接する暗い画素（グリッド線）を白く塗りつぶす。
 
-    グリッド線の写り込みを避けるため、判定前に外周を切り落とす。
+    盤面の外枠は3x3ブロックの内側の罫線より太く描かれることが多く、
+    remove_border のような固定比率のクロップでは太い外枠を除去しきれないことがある。
+    この関数は罫線の太さに関わらず、各辺から連続する暗い画素だけを消していく。
     """
-    inner = remove_border(cell)
-    if inner.size == 0:
+    result = cell.copy()
+    h, w = result.shape[:2]
+
+    for x in range(w):
+        y = 0
+        while y < h and result[y, x] < brightness_threshold:
+            result[y, x] = 255
+            y += 1
+        y = h - 1
+        while y >= 0 and result[y, x] < brightness_threshold:
+            result[y, x] = 255
+            y -= 1
+
+    for y in range(h):
+        x = 0
+        while x < w and result[y, x] < brightness_threshold:
+            result[y, x] = 255
+            x += 1
+        x = w - 1
+        while x >= 0 and result[y, x] < brightness_threshold:
+            result[y, x] = 255
+            x -= 1
+
+    return result
+
+
+def is_blank_cell(
+    cell: np.ndarray,
+    darkness_threshold: int = 150,
+    dark_pixel_ratio_threshold: float = 0.03,
+) -> bool:
+    """セルが空白（数字が書かれていない）かどうかを暗画素の比率で判定する。
+
+    Otsu二値化は「ほぼ均一に明るいだけ」の空白セルに対しても無理に閾値を作ってしまい、
+    JPEGノイズなどのわずかな暗みを誤って前景と判定しがちなので、固定の明度閾値を使う。
+    グリッド線の写り込みを避けるため、判定前に remove_grid_lines と外周クロップを適用する。
+    """
+    cleaned = remove_border(remove_grid_lines(cell))
+    if cleaned.size == 0:
         return True
 
-    _, thresh = cv2.threshold(inner, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    black_ratio = float(np.count_nonzero(thresh)) / thresh.size
-    return black_ratio < black_pixel_ratio_threshold
+    dark_ratio = float(np.count_nonzero(cleaned < darkness_threshold)) / cleaned.size
+    return dark_ratio < dark_pixel_ratio_threshold
