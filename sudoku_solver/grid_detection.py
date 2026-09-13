@@ -4,7 +4,7 @@ old/sudoku-test.ipynb のプロトタイプを土台に、以下の点を堅牢�
 - RETR_EXTERNAL だけでなく RETR_LIST も候補にし、面積・正方形らしさでフィルタする
 - approxPolyDP が厳密に4頂点へ収束しない場合は minAreaRect でフォールバックする
 - 輪郭ベースの検出が失敗した場合、Hough変換で検出した直線群から盤面の外接矩形を推定する
-  （回転にはあまり強くないが、輪郭が崩れやすい低コントラストな写真でのフォールバックとして使う）
+  （minAreaRectで囲むため回転にも対応できる。輪郭が崩れやすい低コントラストな写真向けのフォールバック）
 """
 
 import cv2
@@ -48,12 +48,28 @@ def _quad_aspect_ratio(rect: np.ndarray) -> float:
     return width / height
 
 
+def _bbox_ink_ratio(binary_image: np.ndarray, rect: np.ndarray) -> float:
+    """候補領域（軸並行外接矩形でクロップ）内の黒画素（インク）比率を計算する。"""
+    x, y, w, h = cv2.boundingRect(rect.astype(np.int32))
+    x, y = max(x, 0), max(y, 0)
+    crop = binary_image[y:y + h, x:x + w]
+    if crop.size == 0:
+        return 0.0
+    return float(np.count_nonzero(crop == 0)) / crop.size
+
+
 def _find_grid_corners_contour(
     binary_image: np.ndarray,
     min_area_ratio: float,
     max_aspect_deviation: float,
 ) -> np.ndarray | None:
-    """輪郭ベースの検出。見つからない場合は None を返す（例外は上位で判断する）。"""
+    """輪郭ベースの検出。見つからない場合は None を返す（例外は上位で判断する）。
+
+    候補の採用は面積の大きさではなく、インク密度（黒画素比率）の高さで決める。
+    背景と盤面の白マスが同じ明度に二値化されると、盤面+周囲の余白を含む
+    「白い塊」の外周が最大面積の輪郭になってしまうことがあるが、そちらは
+    余白で薄まってインク密度が低いため、密度基準なら正しく盤面自体を選べる。
+    """
     image_area = binary_image.shape[0] * binary_image.shape[1]
     contours, _ = cv2.findContours(binary_image, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -79,7 +95,7 @@ def _find_grid_corners_contour(
         if aspect == 0 or abs(aspect - 1.0) > max_aspect_deviation:
             continue
 
-        candidates.append((area, rect))
+        candidates.append((_bbox_ink_ratio(binary_image, rect), rect))
 
     if not candidates:
         return None
@@ -92,11 +108,11 @@ def _find_grid_corners_hough(
     gray_image: np.ndarray,
     min_line_length_ratio: float = 0.4,
 ) -> np.ndarray | None:
-    """Hough変換で検出した直線群の外接範囲から盤面の4頂点を推定する。
+    """Hough変換で検出した直線群の端点を囲む最小回転矩形から盤面の4頂点を推定する。
 
     輪郭ベースの検出が失敗するような、低コントラスト・グリッド線が輪郭として
-    繋がりにくい写真向けのフォールバック。回転した盤面には対応できない
-    （軸に沿ったグリッドを前提とする）。
+    繋がりにくい写真向けのフォールバック。minAreaRectで端点群を囲むため、
+    盤面が軸に対して回転していても追従できる。
     """
     h, w = gray_image.shape
     edges = cv2.Canny(gray_image, 50, 150)
@@ -108,27 +124,9 @@ def _find_grid_corners_hough(
     if lines is None:
         return None
 
-    horizontal_ys = []
-    vertical_xs = []
-    for line in lines[:, 0]:
-        x1, y1, x2, y2 = line
-        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-        if abs(angle) < 10 or abs(abs(angle) - 180) < 10:
-            horizontal_ys.extend([y1, y2])
-        elif abs(abs(angle) - 90) < 10:
-            vertical_xs.extend([x1, x2])
-
-    if not horizontal_ys or not vertical_xs:
-        return None
-
-    top, bottom = min(horizontal_ys), max(horizontal_ys)
-    left, right = min(vertical_xs), max(vertical_xs)
-    if bottom - top < min_line_length or right - left < min_line_length:
-        return None
-
-    pts = np.array(
-        [[left, top], [right, top], [left, bottom], [right, bottom]], dtype="float32"
-    )
+    points = lines.reshape(-1, 2).astype("float32")
+    rotated = cv2.minAreaRect(points)
+    pts = cv2.boxPoints(rotated).astype("float32")
     return order_points(pts)
 
 
@@ -138,13 +136,7 @@ def _has_min_ink_ratio(binary_image: np.ndarray, rect: np.ndarray, min_ink_ratio
     真っ白な紙や壁のような「四角いが中身が何もない」領域を盤面と誤検出するのを防ぐ。
     binary_image は preprocess_image の出力（THRESH_BINARY）で、黒(0)がインク部分。
     """
-    x, y, w, h = cv2.boundingRect(rect.astype(np.int32))
-    x, y = max(x, 0), max(y, 0)
-    crop = binary_image[y:y + h, x:x + w]
-    if crop.size == 0:
-        return False
-    ink_ratio = float(np.count_nonzero(crop == 0)) / crop.size
-    return ink_ratio >= min_ink_ratio
+    return _bbox_ink_ratio(binary_image, rect) >= min_ink_ratio
 
 
 def find_grid_corners(
@@ -198,13 +190,21 @@ def warp_to_square(image: np.ndarray, rect: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, matrix, (int(side), int(side)))
 
 
+def detect_grid_from_gray(gray_image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """グレースケール画像（numpy配列）から数独盤面を検出し、正面ビューに補正した画像と4頂点を返す。
+
+    合成テストなど、ファイルを経由せずメモリ上の画像を直接検証したい場合に使う。
+    """
+    binary = preprocess_image(gray_image)
+    rect = find_grid_corners(gray_image, binary)
+    warped = warp_to_square(gray_image, rect)
+    return warped, rect
+
+
 def detect_grid(image_path: str) -> tuple[np.ndarray, np.ndarray]:
     """画像ファイルから数独盤面を検出し、正面ビューに補正した画像と4頂点を返す。"""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"画像の読み込みに失敗しました: {image_path}")
 
-    binary = preprocess_image(img)
-    rect = find_grid_corners(img, binary)
-    warped = warp_to_square(img, rect)
-    return warped, rect
+    return detect_grid_from_gray(img)
