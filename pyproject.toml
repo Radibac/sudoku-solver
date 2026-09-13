@@ -12,3 +12,8 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "pytesseract>=0.3.13",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
